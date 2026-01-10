@@ -33,6 +33,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "libavcodec/avcodec.h"
 #include "libavutil/avstring.h"
 #include "libavutil/dict.h"
 #include "libavutil/common.h"
@@ -67,6 +68,7 @@ typedef struct WAVMuxContext {
     const AVClass *class;
     int64_t data;
     int64_t fact_pos;
+    int64_t mext_pos;          /* MEXT chunk position for MP2 */
     int64_t ds64;
     int64_t minpts;
     int64_t maxpts;
@@ -83,6 +85,12 @@ typedef struct WAVMuxContext {
     int peak_block_size;
     int peak_format;
     int peak_block_pos;
+
+    /* MP2 peak calculation support */
+    AVCodecContext *mp2_dec_ctx;  /* decoder context for MP2 peak calculation */
+    AVFrame *mp2_frame;           /* frame for decoded MP2 samples */
+    AVPacket *mp2_pkt;            /* packet for MP2 decoding */
+    int is_mp2_peak;              /* flag for MP2 peak mode */
     int peak_ppv;
     int peak_bps;
 } WAVMuxContext;
@@ -142,6 +150,81 @@ static void bwf_write_bext_chunk(AVFormatContext *s)
     ff_end_tag(s->pb, bext);
 }
 
+/**
+ * Write MEXT (MPEG Extension) chunk for MP2 WAV files
+ * This chunk is required by Rivendell for MP2-encoded WAV files
+ * with peak envelope data in the LEVL chunk.
+ *
+ * MEXT Chunk Structure (12 bytes of data):
+ *   - sound_information (2 bytes): flags for homogenous, no padding, etc.
+ *   - frame_size (2 bytes): MPEG frame size without padding
+ *   - ancillary_data_length (2 bytes): ancillary data length
+ *   - ancillary_data_def (2 bytes): flags for left/right energy presence
+ *   - reserved (4 bytes): reserved for future use
+ */
+static void bwf_write_mext_chunk(AVFormatContext *s)
+{
+    WAVMuxContext *wav = s->priv_data;
+    AVCodecParameters *par = s->streams[0]->codecpar;
+    int64_t mext;
+    uint16_t sound_info = 0;
+    uint16_t frame_size = 0;
+    uint16_t anc_data_len = 0;
+    uint16_t anc_data_def = 0;
+
+    /* Only write MEXT for MP2 */
+    if (par->codec_id != AV_CODEC_ID_MP2)
+        return;
+
+    mext = ff_start_tag(s->pb, "mext");
+
+    /*
+     * sound_information flags:
+     * bit 0: Homogenous sound data (1 = all frames same configuration)
+     * bit 1: No padding in frames (1 = padding bit always 0)
+     * bit 2: Rate hacked (non-standard sample rate)
+     * bit 3: Free format bitstream
+     */
+    sound_info = 0x0001;  /* Homogenous sound data */
+
+    /*
+     * Calculate approximate MPEG frame size
+     * For MPEG-1 Layer 2: frame_size = 144 * bitrate / sample_rate
+     * Standard frame is 1152 samples
+     */
+    if (par->bit_rate > 0 && par->sample_rate > 0) {
+        frame_size = (uint16_t)(144 * par->bit_rate / par->sample_rate);
+    } else {
+        /* Default to common frame size for 256kbps @ 44100Hz stereo */
+        frame_size = 836;
+    }
+
+    /*
+     * ancillary_data_def flags for peak data presence:
+     * bit 0: Left channel energy present in ancillary data
+     * bit 1: Private byte present
+     * bit 2: Right channel energy present in ancillary data
+     *
+     * When write_peak is enabled, we set both energy flags to indicate
+     * peak data will be in the LEVL chunk (not ancillary data, but Rivendell
+     * uses this as a compatibility indicator)
+     */
+    if (wav->write_peak) {
+        anc_data_def = 0x0005;  /* Left + Right energy flags */
+        anc_data_len = 4;       /* 2 bytes per channel for peak values */
+    }
+
+    avio_wl16(s->pb, sound_info);        /* sound_information */
+    avio_wl16(s->pb, frame_size);        /* frame_size */
+    avio_wl16(s->pb, anc_data_len);      /* ancillary_data_length */
+    avio_wl16(s->pb, anc_data_def);      /* ancillary_data_def */
+    avio_wl32(s->pb, 0);                 /* reserved */
+
+    ff_end_tag(s->pb, mext);
+
+    wav->mext_pos = mext;
+}
+
 static av_cold void wav_deinit(AVFormatContext *s)
 {
     WAVMuxContext *wav = s->priv_data;
@@ -149,6 +232,17 @@ static av_cold void wav_deinit(AVFormatContext *s)
     av_freep(&wav->peak_maxpos);
     av_freep(&wav->peak_maxneg);
     av_freep(&wav->peak_output);
+
+    /* Clean up MP2 decoder resources */
+    if (wav->mp2_dec_ctx) {
+        avcodec_free_context(&wav->mp2_dec_ctx);
+    }
+    if (wav->mp2_frame) {
+        av_frame_free(&wav->mp2_frame);
+    }
+    if (wav->mp2_pkt) {
+        av_packet_free(&wav->mp2_pkt);
+    }
 }
 
 static av_cold int peak_init_writer(AVFormatContext *s)
@@ -156,16 +250,67 @@ static av_cold int peak_init_writer(AVFormatContext *s)
     WAVMuxContext *wav = s->priv_data;
     AVCodecParameters *par = s->streams[0]->codecpar;
 
-    if (par->codec_id != AV_CODEC_ID_PCM_S8 &&
-        par->codec_id != AV_CODEC_ID_PCM_S16LE &&
-        par->codec_id != AV_CODEC_ID_PCM_U8 &&
-        par->codec_id != AV_CODEC_ID_PCM_U16LE) {
+    /* Handle MP2 codec - decode and calculate peaks from decoded PCM */
+    if (par->codec_id == AV_CODEC_ID_MP2) {
+        const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_MP2);
+        int ret;
+
+        if (!codec) {
+            av_log(s, AV_LOG_ERROR, "MP2 decoder not found for Peak Chunk calculation\n");
+            return AVERROR_DECODER_NOT_FOUND;
+        }
+
+        wav->mp2_dec_ctx = avcodec_alloc_context3(codec);
+        if (!wav->mp2_dec_ctx) {
+            av_log(s, AV_LOG_ERROR, "Failed to allocate MP2 decoder context\n");
+            return AVERROR(ENOMEM);
+        }
+
+        /* Set decoder parameters from stream */
+        wav->mp2_dec_ctx->sample_rate = par->sample_rate;
+        wav->mp2_dec_ctx->ch_layout = par->ch_layout;
+
+        ret = avcodec_open2(wav->mp2_dec_ctx, codec, NULL);
+        if (ret < 0) {
+            av_log(s, AV_LOG_ERROR, "Failed to open MP2 decoder: %s\n", av_err2str(ret));
+            avcodec_free_context(&wav->mp2_dec_ctx);
+            return ret;
+        }
+
+        wav->mp2_frame = av_frame_alloc();
+        if (!wav->mp2_frame) {
+            avcodec_free_context(&wav->mp2_dec_ctx);
+            return AVERROR(ENOMEM);
+        }
+
+        wav->mp2_pkt = av_packet_alloc();
+        if (!wav->mp2_pkt) {
+            av_frame_free(&wav->mp2_frame);
+            avcodec_free_context(&wav->mp2_dec_ctx);
+            return AVERROR(ENOMEM);
+        }
+
+        wav->is_mp2_peak = 1;
+        wav->peak_bps = 2;  /* 16-bit samples after decoding */
+
+        /* For Rivendell compatibility, use block size of 1152 (MPEG frame size)
+         * if user hasn't specified a different value */
+        if (wav->peak_block_size == 256) {  /* default value */
+            wav->peak_block_size = 1152;
+            av_log(s, AV_LOG_INFO, "Setting peak_block_size to 1152 for MP2 (Rivendell compatible)\n");
+        }
+
+        av_log(s, AV_LOG_INFO, "MP2 Peak Chunk support enabled - decoding frames for peak calculation\n");
+    } else if (par->codec_id != AV_CODEC_ID_PCM_S8 &&
+               par->codec_id != AV_CODEC_ID_PCM_S16LE &&
+               par->codec_id != AV_CODEC_ID_PCM_U8 &&
+               par->codec_id != AV_CODEC_ID_PCM_U16LE) {
         av_log(s, AV_LOG_ERROR, "Codec %s not supported for Peak Chunk\n",
                avcodec_get_name(par->codec_id));
         return -1;
+    } else {
+        wav->peak_bps = av_get_bits_per_sample(par->codec_id) / 8;
     }
-
-    wav->peak_bps = av_get_bits_per_sample(par->codec_id) / 8;
 
     if (wav->peak_bps == 1 && wav->peak_format == PEAK_FORMAT_UINT16) {
         av_log(s, AV_LOG_ERROR,
@@ -343,6 +488,11 @@ static int wav_write_header(AVFormatContext *s)
         ff_end_tag(pb, wav->fact_pos);
     }
 
+    /* Write MEXT chunk for MP2 WAV files (required by Rivendell) */
+    if (s->streams[0]->codecpar->codec_id == AV_CODEC_ID_MP2) {
+        bwf_write_mext_chunk(s);
+    }
+
     if (wav->write_bext)
         bwf_write_bext_chunk(s);
 
@@ -376,23 +526,112 @@ static int wav_write_packet(AVFormatContext *s, AVPacket *pkt)
         avio_write(pb, pkt->data, pkt->size);
 
     if (wav->write_peak) {
-        int c = 0;
-        int i;
-        for (i = 0; i < pkt->size; i += wav->peak_bps) {
-            if (wav->peak_bps == 1) {
-                wav->peak_maxpos[c] = FFMAX(wav->peak_maxpos[c], *(int8_t*)(pkt->data + i));
-                wav->peak_maxneg[c] = FFMIN(wav->peak_maxneg[c], *(int8_t*)(pkt->data + i));
-            } else {
-                wav->peak_maxpos[c] = FFMAX(wav->peak_maxpos[c], (int16_t)AV_RL16(pkt->data + i));
-                wav->peak_maxneg[c] = FFMIN(wav->peak_maxneg[c], (int16_t)AV_RL16(pkt->data + i));
+        if (wav->is_mp2_peak) {
+            /* MP2: Decode the packet and calculate peaks from decoded samples */
+            int ret;
+
+            ret = avcodec_send_packet(wav->mp2_dec_ctx, pkt);
+            if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
+                av_log(s, AV_LOG_WARNING, "Error sending MP2 packet for peak calculation: %s\n",
+                       av_err2str(ret));
             }
-            if (++c == s->streams[0]->codecpar->ch_layout.nb_channels) {
-                c = 0;
-                if (++wav->peak_block_pos == wav->peak_block_size) {
-                    int ret = peak_write_frame(s);
-                    if (ret < 0)
-                        return ret;
-                    wav->peak_block_pos = 0;
+
+            while (ret >= 0) {
+                ret = avcodec_receive_frame(wav->mp2_dec_ctx, wav->mp2_frame);
+                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                    break;
+                } else if (ret < 0) {
+                    av_log(s, AV_LOG_WARNING, "Error receiving decoded frame for peak calculation: %s\n",
+                           av_err2str(ret));
+                    break;
+                }
+
+                /* Calculate peaks from decoded samples (16-bit signed PCM) */
+                {
+                    int nb_samples = wav->mp2_frame->nb_samples;
+                    int nb_channels = wav->mp2_frame->ch_layout.nb_channels;
+                    int c, i;
+
+                    /* Handle planar vs interleaved format */
+                    if (av_sample_fmt_is_planar(wav->mp2_frame->format)) {
+                        /* Planar format: separate buffer per channel */
+                        for (i = 0; i < nb_samples; i++) {
+                            for (c = 0; c < nb_channels; c++) {
+                                int16_t sample;
+                                if (wav->mp2_frame->format == AV_SAMPLE_FMT_S16P) {
+                                    sample = ((int16_t *)wav->mp2_frame->extended_data[c])[i];
+                                } else if (wav->mp2_frame->format == AV_SAMPLE_FMT_FLTP) {
+                                    float fsample = ((float *)wav->mp2_frame->extended_data[c])[i];
+                                    sample = (int16_t)(FFMIN(FFMAX(fsample, -1.0f), 1.0f) * 32767);
+                                } else if (wav->mp2_frame->format == AV_SAMPLE_FMT_S32P) {
+                                    sample = ((int32_t *)wav->mp2_frame->extended_data[c])[i] >> 16;
+                                } else {
+                                    sample = 0;
+                                }
+                                wav->peak_maxpos[c] = FFMAX(wav->peak_maxpos[c], sample);
+                                wav->peak_maxneg[c] = FFMIN(wav->peak_maxneg[c], sample);
+                            }
+                            if (++wav->peak_block_pos == wav->peak_block_size) {
+                                int write_ret = peak_write_frame(s);
+                                if (write_ret < 0)
+                                    return write_ret;
+                                wav->peak_block_pos = 0;
+                            }
+                        }
+                    } else {
+                        /* Interleaved format */
+                        int16_t *samples = (int16_t *)wav->mp2_frame->data[0];
+                        float *fsamples = (float *)wav->mp2_frame->data[0];
+                        int32_t *isamples = (int32_t *)wav->mp2_frame->data[0];
+
+                        for (i = 0; i < nb_samples; i++) {
+                            for (c = 0; c < nb_channels; c++) {
+                                int16_t sample;
+                                if (wav->mp2_frame->format == AV_SAMPLE_FMT_S16) {
+                                    sample = samples[i * nb_channels + c];
+                                } else if (wav->mp2_frame->format == AV_SAMPLE_FMT_FLT) {
+                                    float fsample = fsamples[i * nb_channels + c];
+                                    sample = (int16_t)(FFMIN(FFMAX(fsample, -1.0f), 1.0f) * 32767);
+                                } else if (wav->mp2_frame->format == AV_SAMPLE_FMT_S32) {
+                                    sample = isamples[i * nb_channels + c] >> 16;
+                                } else {
+                                    sample = 0;
+                                }
+                                wav->peak_maxpos[c] = FFMAX(wav->peak_maxpos[c], sample);
+                                wav->peak_maxneg[c] = FFMIN(wav->peak_maxneg[c], sample);
+                            }
+                            if (++wav->peak_block_pos == wav->peak_block_size) {
+                                int write_ret = peak_write_frame(s);
+                                if (write_ret < 0)
+                                    return write_ret;
+                                wav->peak_block_pos = 0;
+                            }
+                        }
+                    }
+                }
+
+                av_frame_unref(wav->mp2_frame);
+            }
+        } else {
+            /* PCM: Original peak calculation */
+            int c = 0;
+            int i;
+            for (i = 0; i < pkt->size; i += wav->peak_bps) {
+                if (wav->peak_bps == 1) {
+                    wav->peak_maxpos[c] = FFMAX(wav->peak_maxpos[c], *(int8_t*)(pkt->data + i));
+                    wav->peak_maxneg[c] = FFMIN(wav->peak_maxneg[c], *(int8_t*)(pkt->data + i));
+                } else {
+                    wav->peak_maxpos[c] = FFMAX(wav->peak_maxpos[c], (int16_t)AV_RL16(pkt->data + i));
+                    wav->peak_maxneg[c] = FFMIN(wav->peak_maxneg[c], (int16_t)AV_RL16(pkt->data + i));
+                }
+                if (++c == s->streams[0]->codecpar->ch_layout.nb_channels) {
+                    c = 0;
+                    if (++wav->peak_block_pos == wav->peak_block_size) {
+                        int ret = peak_write_frame(s);
+                        if (ret < 0)
+                            return ret;
+                        wav->peak_block_pos = 0;
+                    }
                 }
             }
         }
@@ -415,6 +654,81 @@ static int wav_write_trailer(AVFormatContext *s)
     int64_t number_of_samples = 0;
     int rf64 = 0;
     int ret = 0;
+
+    /* Flush MP2 decoder to get any remaining samples for peak calculation */
+    if (wav->write_peak && wav->is_mp2_peak && wav->mp2_dec_ctx) {
+        int flush_ret;
+
+        /* Send NULL packet to flush decoder */
+        flush_ret = avcodec_send_packet(wav->mp2_dec_ctx, NULL);
+        if (flush_ret >= 0) {
+            while (1) {
+                flush_ret = avcodec_receive_frame(wav->mp2_dec_ctx, wav->mp2_frame);
+                if (flush_ret == AVERROR_EOF || flush_ret == AVERROR(EAGAIN))
+                    break;
+                if (flush_ret < 0)
+                    break;
+
+                /* Process remaining decoded samples */
+                {
+                    int nb_samples = wav->mp2_frame->nb_samples;
+                    int nb_channels = wav->mp2_frame->ch_layout.nb_channels;
+                    int c, i;
+
+                    if (av_sample_fmt_is_planar(wav->mp2_frame->format)) {
+                        for (i = 0; i < nb_samples; i++) {
+                            for (c = 0; c < nb_channels; c++) {
+                                int16_t sample;
+                                if (wav->mp2_frame->format == AV_SAMPLE_FMT_S16P) {
+                                    sample = ((int16_t *)wav->mp2_frame->extended_data[c])[i];
+                                } else if (wav->mp2_frame->format == AV_SAMPLE_FMT_FLTP) {
+                                    float fsample = ((float *)wav->mp2_frame->extended_data[c])[i];
+                                    sample = (int16_t)(FFMIN(FFMAX(fsample, -1.0f), 1.0f) * 32767);
+                                } else if (wav->mp2_frame->format == AV_SAMPLE_FMT_S32P) {
+                                    sample = ((int32_t *)wav->mp2_frame->extended_data[c])[i] >> 16;
+                                } else {
+                                    sample = 0;
+                                }
+                                wav->peak_maxpos[c] = FFMAX(wav->peak_maxpos[c], sample);
+                                wav->peak_maxneg[c] = FFMIN(wav->peak_maxneg[c], sample);
+                            }
+                            if (++wav->peak_block_pos == wav->peak_block_size) {
+                                peak_write_frame(s);
+                                wav->peak_block_pos = 0;
+                            }
+                        }
+                    } else {
+                        int16_t *samples = (int16_t *)wav->mp2_frame->data[0];
+                        float *fsamples = (float *)wav->mp2_frame->data[0];
+                        int32_t *isamples = (int32_t *)wav->mp2_frame->data[0];
+
+                        for (i = 0; i < nb_samples; i++) {
+                            for (c = 0; c < nb_channels; c++) {
+                                int16_t sample;
+                                if (wav->mp2_frame->format == AV_SAMPLE_FMT_S16) {
+                                    sample = samples[i * nb_channels + c];
+                                } else if (wav->mp2_frame->format == AV_SAMPLE_FMT_FLT) {
+                                    float fsample = fsamples[i * nb_channels + c];
+                                    sample = (int16_t)(FFMIN(FFMAX(fsample, -1.0f), 1.0f) * 32767);
+                                } else if (wav->mp2_frame->format == AV_SAMPLE_FMT_S32) {
+                                    sample = isamples[i * nb_channels + c] >> 16;
+                                } else {
+                                    sample = 0;
+                                }
+                                wav->peak_maxpos[c] = FFMAX(wav->peak_maxpos[c], sample);
+                                wav->peak_maxneg[c] = FFMIN(wav->peak_maxneg[c], sample);
+                            }
+                            if (++wav->peak_block_pos == wav->peak_block_size) {
+                                peak_write_frame(s);
+                                wav->peak_block_pos = 0;
+                            }
+                        }
+                    }
+                }
+                av_frame_unref(wav->mp2_frame);
+            }
+        }
+    }
 
     if (s->pb->seekable & AVIO_SEEKABLE_NORMAL) {
         if (wav->write_peak != PEAK_ONLY && avio_tell(pb) - wav->data < UINT32_MAX) {
