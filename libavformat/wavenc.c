@@ -201,23 +201,22 @@ static void bwf_write_mext_chunk(AVFormatContext *s)
 
     /*
      * ancillary_data_def flags for peak data presence:
-     * bit 0: Left channel energy present in ancillary data
+     * bit 0: Left channel energy present in ancillary data (per-frame)
      * bit 1: Private byte present
-     * bit 2: Right channel energy present in ancillary data
+     * bit 2: Right channel energy present in ancillary data (per-frame)
      *
-     * When write_peak is enabled, we set both energy flags to indicate
-     * peak data will be in the LEVL chunk (not ancillary data, but Rivendell
-     * uses this as a compatibility indicator)
+     * IMPORTANT: These flags indicate peak data is embedded in the ancillary
+     * bytes at the end of each MP2 frame, NOT in a separate LEVL chunk.
+     * Since we write peak data to a LEVL chunk (not per-frame ancillary data),
+     * we must NOT set these flags. Rivendell reads the LEVL chunk separately
+     * and will crash if these flags are set without actual per-frame data.
      */
-    if (wav->write_peak) {
-        anc_data_def = 0x0005;  /* Left + Right energy flags */
-        anc_data_len = 4;       /* 2 bytes per channel for peak values */
-    }
+    /* Do NOT set anc_data_def energy flags - we use LEVL chunk for peaks */
 
     avio_wl16(s->pb, sound_info);        /* sound_information */
     avio_wl16(s->pb, frame_size);        /* frame_size */
-    avio_wl16(s->pb, anc_data_len);      /* ancillary_data_length */
-    avio_wl16(s->pb, anc_data_def);      /* ancillary_data_def */
+    avio_wl16(s->pb, anc_data_len);      /* ancillary_data_length (0) */
+    avio_wl16(s->pb, anc_data_def);      /* ancillary_data_def (0) */
     avio_wl32(s->pb, 0);                 /* reserved */
 
     ff_end_tag(s->pb, mext);
