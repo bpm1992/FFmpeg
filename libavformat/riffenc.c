@@ -113,7 +113,10 @@ int ff_put_wav_header(AVFormatContext *s, AVIOContext *pb,
     }
 
     if (par->codec_id == AV_CODEC_ID_MP2) {
-        blkalign = (144 * par->bit_rate - 1)/par->sample_rate + 1;
+        /* Use truncating division to match Rivendell's MAD decoder frame size calculation:
+         * mad_frame_size = 144 * bit_rate / sample_rate
+         * Rounding up causes frame sync issues in some players. */
+        blkalign = 144 * par->bit_rate / par->sample_rate;
     } else if (par->codec_id == AV_CODEC_ID_MP3) {
         blkalign = 576 * (par->sample_rate <= (24000 + 32000)/2 ? 1 : 2);
     } else if (par->codec_id == AV_CODEC_ID_AC3) {
